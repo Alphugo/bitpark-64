@@ -1,3 +1,4 @@
+# Run with -HourlyRate 30 to change the price or -SelfTest to test the program.
 param(
     [ValidateRange(1, 1000000)][int]$HourlyRate = 20,
     [switch]$SelfTest
@@ -9,15 +10,20 @@ $timestampFormat = 'yyyy-MM-dd HH:mm:ss.fffffff zzz'
 
 function Get-SlotBit([int]$Slot) {
     if ($Slot -lt 1 -or $Slot -gt 64) { throw 'Slot must be from 1 to 64.' }
+    # Build a mask with just this slot's bit set. Slot 1 uses bit 0.
+    # The unsigned 64-bit type lets the mask use all 64 bits, including bit 63.
     return ([uint64]1 -shl ($Slot - 1))
 }
 
 function Get-Fee([datetimeoffset]$Entered, [datetimeoffset]$Exited, [int]$Rate) {
+    # Round partial hours up. Even an immediate checkout costs one hour.
     $hours = [math]::Max(1, [math]::Ceiling(($Exited - $Entered).TotalHours))
     return [long]$hours * $Rate
 }
 
 function Read-State {
+    # A zero bit means free, and a one bit means occupied.
+    # The Sessions table stores the plate, entry time, and rate for each occupied slot.
     $state = @{ Register = [uint64]0; Sessions = @{} }
     if (-not (Test-Path -LiteralPath $dataPath)) { return $state }
 
@@ -26,6 +32,7 @@ function Read-State {
         throw 'The parking data file has an unsupported format.'
     }
     $plates = @{}
+    # Rebuild the occupancy register from the saved sessions when the app starts.
     foreach ($record in $saved.Sessions) {
         $slot = [int]$record.Slot
         $bit = Get-SlotBit $slot
@@ -51,6 +58,7 @@ function Save-State($State) {
     $snapshot = @{ Version = 1; Sessions = @($State.Sessions.Values | Sort-Object { $_.Slot }) }
     $tempPath = "$dataPath.tmp"
     try {
+        # Finish writing the new file before replacing the previous save.
         $snapshot | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $tempPath -Encoding UTF8
         if ([io.file]::Exists($dataPath)) {
             [io.file]::Replace($tempPath, $dataPath, [System.Management.Automation.Language.NullString]::Value)
@@ -70,9 +78,12 @@ function Add-Parking($State, [string]$Plate, [int]$Rate, [datetimeoffset]$Now) {
     foreach ($session in $State.Sessions.Values) {
         if ($session.Plate -eq $Plate) { throw "Vehicle $Plate is already parked in slot $($session.Slot)." }
     }
+    # Scan in slot order so the first free slot gets assigned.
     for ($slot = 1; $slot -le 64; $slot++) {
         $bit = Get-SlotBit $slot
+        # AND isolates this slot's bit. Zero means the slot is free.
         if (($State.Register -band $bit) -eq 0) {
+            # OR turns on the selected bit and leaves the other slots as they are.
             $State.Register = $State.Register -bor $bit
             $State.Sessions[$slot] = @{
                 Slot = $slot; Plate = $Plate; Rate = $Rate
@@ -92,7 +103,9 @@ function Remove-Parking($State, [int]$Slot, [datetimeoffset]$Now) {
         $session.Entered, $timestampFormat, [cultureinfo]::InvariantCulture
     )
     if ($Now -lt $entered) { throw 'The current time is earlier than the recorded entry time.' }
+    # Use the rate saved at entry so a new hourly rate cannot change this bill.
     $fee = Get-Fee $entered $Now $session.Rate
+    # Invert the mask so the selected bit is zero. AND clears only that bit.
     $State.Register = $State.Register -band (-bnot $bit)
     $State.Sessions.Remove($Slot)
     return @{
@@ -103,6 +116,7 @@ function Remove-Parking($State, [int]$Slot, [datetimeoffset]$Now) {
 }
 
 function Show-Lot($State) {
+    # One hexadecimal digit represents four bits, so 16 digits show the whole register.
     Write-Host ('Occupancy register: 0x{0:X16}' -f $State.Register)
     Write-Host ('{0}/64 occupied | {1} free' -f $State.Sessions.Count, (64 - $State.Sessions.Count))
     Write-Host 'O = occupied, . = free'
@@ -118,6 +132,7 @@ function Show-Lot($State) {
 }
 
 if ($SelfTest) {
+    # Use a separate save file and a fixed time for repeatable tests.
     $testTime = [datetimeoffset]'2026-01-01T08:00:00+00:00'
     $dataPath = Join-Path $PSScriptRoot ("self-test-{0}.json" -f [guid]::NewGuid())
     try {
@@ -173,6 +188,7 @@ try {
                     $plate = Read-Host 'Plate number'
                     $state = Read-State
                     $slot = Add-Parking $state $plate $HourlyRate ([datetimeoffset]::UtcNow)
+                    # Confirm the entry only after the updated sessions are saved.
                     Save-State $state
                     Write-Host "Vehicle $($state.Sessions[$slot].Plate) parked in slot $slot."
                 }
@@ -203,6 +219,7 @@ try {
             }
         } catch {
             Write-Host $_.Exception.Message -ForegroundColor Yellow
+            # Reload the last saved state if the operation fails.
             $state = Read-State
         }
     }
